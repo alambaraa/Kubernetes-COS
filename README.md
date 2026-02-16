@@ -1,268 +1,98 @@
+# Actividad 3 — Kubernetes (kubeadm) + Web + NFS + HPA + MetalLB + Ansible + Prometheus/Grafana
 
-# Kubernetes Lab (kubeadm): NFS (RWX) + Web PHP + Metrics Server + HPA + MetalLB (LoadBalancer)
-
-Este README recopila **toda la información relevante** de la práctica: arquitectura, comandos ejecutados, manifiestos YAML creados, parches aplicados y verificaciones.
+> Proyecto realizado siguiendo los requisitos de **actividad_3**: clúster con **kubeadm (1 master + 2 workers)**, despliegue de **servidor web (Apache/PHP)** con **YAML**, **HPA** (requiere **metrics-server**), **MetalLB** para `LoadBalancer`, y **NFS** para persistencia compartida por todos los pods web. :contentReference[oaicite:0]{index=0}
 
 ---
 
-## 0) Arquitectura y red
+## 1) Topología y red
 
-### Red VirtualBox
-- NAT Network: `red-k8s`
-- Rango: `192.168.1.0/24`
-- Gateway típico: `192.168.1.1`
-
-### Nodos
-- **master (control-plane)**: `192.168.1.6`
+### VMs / IPs (red NAT “red-k8s”)
+- **master**: `192.168.1.6`
 - **worker1**: `192.168.1.7`
 - **worker2**: `192.168.1.8`
 - **nfs**: `192.168.1.9`
+- **ansible**: `192.168.1.5` (nodo de automatización)
+- **monitor**: `192.168.1.4` (nuevo worker para Prometheus/Grafana)
 
-### MetalLB
-- Pool IPs: `192.168.1.20-192.168.1.30`
-- IP asignada al Service web: `192.168.1.20`
-
----
-
-## 1) Preparación base (master + workers)
-
-### Hostnames
-```bash
-sudo hostnamectl set-hostname master    # master
-sudo hostnamectl set-hostname worker1   # worker1
-sudo hostnamectl set-hostname worker2   # worker2
-````
-
-### /etc/hosts (en master y workers)
-
-```txt
-192.168.1.6 master
-192.168.1.7 worker1
-192.168.1.8 worker2
-192.168.1.9 nfs
-```
-
-### Swap OFF (requisito kubelet/kubeadm)
-
-```bash
-sudo swapoff -a
-sudo sed -i '/ swap / s/^/#/' /etc/fstab
-free -h | grep -i swap
-```
-
-### Kernel/network params (CNI / iptables sobre bridge)
-
-```bash
-cat <<'EOF' | sudo tee /etc/modules-load.d/k8s.conf
-br_netfilter
-EOF
-sudo modprobe br_netfilter
-
-cat <<'EOF' | sudo tee /etc/sysctl.d/k8s.conf
-net.ipv4.ip_forward = 1
-net.bridge.bridge-nf-call-iptables = 1
-net.bridge.bridge-nf-call-ip6tables = 1
-EOF
-sudo sysctl --system
-
-sysctl net.ipv4.ip_forward
-lsmod | grep br_netfilter
-```
+> Nota: La actividad define explícitamente el uso de red NAT y las IPs/recursos orientativos para las VMs. :contentReference[oaicite:1]{index=1}
 
 ---
 
-## 2) Runtime: containerd (AlmaLinux 9 minimal)
+## 2) Kubernetes con kubeadm (cluster base)
 
-> En AlmaLinux minimal `containerd` no estaba disponible en repos por defecto, se instaló `containerd.io` desde el repo de Docker.
+### 2.1 Prerrequisitos (en master y workers)
+Comprobaciones habituales:
+- Conectividad (gateway e Internet): `ip r`, `ping -c 1 8.8.8.8`
+- Swap deshabilitado: `free -h | grep -i swap` (Swap: 0)
+- Forwarding IPv4 habilitado: `sysctl net.ipv4.ip_forward` (debe ser 1)
 
-```bash
-sudo dnf -y install dnf-plugins-core
-sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-sudo dnf -y install containerd.io
-```
+Servicios:
+- `containerd` instalado y activo
+- `kubelet` habilitado y arrancado (queda en “activating” hasta que el nodo se une/arranca el control-plane)
 
-### Configurar systemd cgroups
-
-```bash
-sudo mkdir -p /etc/containerd
-containerd config default | sudo tee /etc/containerd/config.toml >/dev/null
-sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-
-sudo systemctl enable --now containerd
-systemctl is-active containerd
-grep -n "SystemdCgroup" /etc/containerd/config.toml
-```
+#### containerd y SystemdCgroup
+Se verificó / ajustó:
+- `/etc/containerd/config.toml` → `SystemdCgroup = true`
 
 ---
 
-## 3) Kubernetes paquetes + ajustes OS (laboratorio)
+### 2.2 Inicialización del control-plane
+En **master**:
+- `kubeadm init ...` (con CIDR compatible con Flannel)
+- Configurar kubeconfig para kubectl (usuario administrador)
 
-### SELinux permissive + firewall OFF (lab)
-
-```bash
-sudo setenforce 0
-sudo sed -i 's/^SELINUX=.*/SELINUX=permissive/' /etc/selinux/config
-sudo systemctl disable --now firewalld
-
-getenforce
-systemctl is-active firewalld
-```
-
-### Repo Kubernetes (v1.29) y paquetes
-
-```bash
-cat <<'EOF' | sudo tee /etc/yum.repos.d/kubernetes.repo
-[kubernetes]
-name=Kubernetes
-baseurl=https://pkgs.k8s.io/core:/stable:/v1.29/rpm/
-enabled=1
-gpgcheck=1
-repo_gpgcheck=1
-gpgkey=https://pkgs.k8s.io/core:/stable:/v1.29/rpm/repodata/repomd.xml.key
-EOF
-
-sudo dnf makecache
-```
-
-* Master:
-
-```bash
-sudo dnf -y install kubelet kubeadm kubectl
-sudo systemctl enable --now kubelet
-```
-
-* Workers:
-
-```bash
-sudo dnf -y install kubelet kubeadm
-sudo systemctl enable --now kubelet
-```
-
-> Nota: antes de `kubeadm init`, `kubelet` puede aparecer en `activating (auto-restart)`.
+> En kubeadm, el init genera también el comando `kubeadm join` para los workers. :contentReference[oaicite:2]{index=2}
 
 ---
 
-## 4) Crear cluster con kubeadm
-
-### kubeadm init (master)
-
-```bash
-sudo kubeadm init \
-  --apiserver-advertise-address=192.168.1.6 \
-  --pod-network-cidr=10.244.0.0/16
-```
-
-### kubeconfig para kubectl (master)
-
-```bash
-mkdir -p $HOME/.kube
-sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
-sudo chown $(id -u):$(id -g) $HOME/.kube/config
-kubectl get nodes -o wide
-```
-
-### Instalar CNI (Flannel)
-
-```bash
-kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
-kubectl get nodes
-kubectl get pods -A
-```
-
-### Unir workers (worker1 y worker2)
-
-```bash
-sudo kubeadm join 192.168.1.6:6443 --token <TOKEN> \
-  --discovery-token-ca-cert-hash sha256:<HASH>
-```
-
-### Validación cluster
-
-```bash
-kubectl get nodes -o wide
-kubectl get pods -A
-kubectl get pods -n kube-flannel -o wide
-```
+### 2.3 CNI (Flannel)
+Se instaló **Flannel** y se verificó:
+- Namespace `kube-flannel`
+- DaemonSet de flannel ejecutándose en los nodos
 
 ---
 
-## 5) NFS Server (VM `nfs` 192.168.1.9)
+### 2.4 Join de workers
+En **worker1** y **worker2**:
+- `kubeadm join 192.168.1.6:6443 --token ... --discovery-token-ca-cert-hash ...`
 
-### Instalar y configurar NFS (en nfs)
-
-```bash
-sudo dnf -y install nfs-utils
-sudo mkdir -p /srv/nfs/web
-sudo chmod -R 0777 /srv/nfs/web
-
-echo "/srv/nfs/web 192.168.1.0/24(rw,sync,no_subtree_check,no_root_squash)" | sudo tee /etc/exports
-
-sudo systemctl enable --now rpcbind
-sudo systemctl enable --now nfs-server
-sudo exportfs -rav
-
-# Laboratorio: apagar firewall en nfs
-sudo systemctl disable --now firewalld
-
-rpcinfo -p localhost | head
-exportfs -v
-```
-
-### Contenido web (en nfs)
-
-```bash
-cat <<'EOF' | sudo tee /srv/nfs/web/index.php
-<?php
-echo "<h1>Hola desde Kubernetes</h1>";
-echo "<p>Pod: " . gethostname() . "</p>";
-echo "<p>Fecha: " . date('c') . "</p>";
-?>
-EOF
-```
-
-### Comprobación desde master
-
-```bash
-ping -c 2 192.168.1.9
-showmount -e 192.168.1.9
-```
-
-### Cliente NFS en nodos Kubernetes (master + workers)
-
-```bash
-sudo dnf -y install nfs-utils
-```
+Verificación en **master**:
+- `kubectl get nodes -o wide` → todos `Ready`
 
 ---
 
-## 6) Manifests YAML creados
+## 3) Despliegue web con NFS (PV/PVC) — Requisito actividad_3
 
-> Carpeta recomendada:
+### 3.1 NFS server (nodo `nfs` 192.168.1.9)
+Export:
+- Directorio: `/srv/nfs/web`
+- Red permitida: `192.168.1.0/24`
 
-* `~/k8s-manifests/nfs/`
-* `~/k8s-manifests/web/`
-* `~/k8s-manifests/metallb/`
+Comandos típicos:
+- `exportfs -v`
+- `showmount -e 192.168.1.9`
+- Servicios: `rpcbind`, `nfs-server`
 
-### 6.1 Namespace `web` (opcional pero recomendado)
+> Requisito: “Añadir nodo NFS… y todos los pods deben servir la misma página almacenada en NFS”. :contentReference[oaicite:3]{index=3}
 
-**web-namespace.yaml**
+---
 
+### 3.2 Namespace “web”
+`manifests/web/01-namespace.yaml`
 ```yaml
 apiVersion: v1
 kind: Namespace
 metadata:
   name: web
-```
+````
 
-Aplicar:
+> Los recursos se organizan por **namespace**; es separación lógica y afecta a nombres/operaciones. 
 
-```bash
-kubectl apply -f web-namespace.yaml
-```
+---
 
-### 6.2 PV NFS (RWX)
+### 3.3 PersistentVolume (PV) NFS
 
-**pv-nfs-web.yaml**
+`manifests/web/02-pv-nfs-web.yaml`
 
 ```yaml
 apiVersion: v1
@@ -280,9 +110,9 @@ spec:
     path: /srv/nfs/web
 ```
 
-### 6.3 PVC NFS (RWX)
+### 3.4 PersistentVolumeClaim (PVC) NFS
 
-**pvc-nfs-web.yaml**
+`manifests/web/03-pvc-nfs-web.yaml`
 
 ```yaml
 apiVersion: v1
@@ -296,21 +126,20 @@ spec:
   resources:
     requests:
       storage: 1Gi
-  storageClassName: ""
+  volumeName: pv-nfs-web
 ```
 
-Aplicar/validar:
+Verificación:
 
-```bash
-kubectl apply -f pv-nfs-web.yaml
-kubectl apply -f pvc-nfs-web.yaml
-kubectl get pv
-kubectl get pvc -n web
-```
+* `kubectl get pv`
+* `kubectl -n web get pvc`
+* `kubectl -n web describe pvc pvc-nfs-web`
 
-### 6.4 Deployment Web PHP (monta PVC en /var/www/html)
+---
 
-**web-deploy.yaml**
+### 3.5 Deployment web (Apache/PHP) usando PVC NFS
+
+`manifests/web/04-deployment.yaml`
 
 ```yaml
 apiVersion: apps/v1
@@ -333,6 +162,9 @@ spec:
         image: php:8.2-apache
         ports:
         - containerPort: 80
+        volumeMounts:
+        - name: webcontent
+          mountPath: /var/www/html
         resources:
           requests:
             cpu: 100m
@@ -340,26 +172,21 @@ spec:
           limits:
             cpu: 300m
             memory: 256Mi
-        volumeMounts:
-        - name: webcontent
-          mountPath: /var/www/html
       volumes:
       - name: webcontent
         persistentVolumeClaim:
           claimName: pvc-nfs-web
 ```
 
-Aplicar/validar:
+> Recordatorio conceptual: en Kubernetes los manifests se basan en `metadata/spec/status`: **spec** es lo deseado, **status** lo observado (lo que el clúster ha conseguido). 
 
-```bash
-kubectl apply -f web-deploy.yaml
-kubectl -n web rollout status deploy/web-php
-kubectl -n web get pods -o wide
-```
+---
 
-### 6.5 Service (final) LoadBalancer “limpio” sin NodePort
+### 3.6 Service para exponer la web
 
-**web-svc-lb.yaml**
+Inicialmente (NodePort), y después con MetalLB (LoadBalancer).
+
+`manifests/web/05-service-lb.yaml`
 
 ```yaml
 apiVersion: v1
@@ -369,27 +196,53 @@ metadata:
   namespace: web
 spec:
   type: LoadBalancer
-  allocateLoadBalancerNodePorts: false
-  loadBalancerIP: 192.168.1.20
   selector:
     app: web-php
   ports:
   - port: 80
     targetPort: 80
-    protocol: TCP
 ```
 
-Aplicar/validar:
+Verificación:
 
-```bash
-kubectl apply -f web-svc-lb.yaml
-kubectl -n web get svc web-php-svc -o wide
-curl -s http://192.168.1.20 | head
-```
+* `kubectl -n web get svc -o wide`
+* `curl -s http://<EXTERNAL-IP> | head`
 
-### 6.6 HPA (autoscaling/v2) por CPU
+---
 
-**hpa-web.yaml**
+## 4) Metrics-server (necesario para HPA)
+
+### 4.1 Instalación
+
+* Se desplegó metrics-server en `kube-system`
+
+### 4.2 Problema encontrado
+
+Errores de scrape a kubelet por TLS:
+
+* `x509: cannot validate certificate ... doesn't contain any IP SANs`
+
+### 4.3 Fix aplicado
+
+Se ajustó el deployment de metrics-server (args), incluyendo:
+
+* `--kubelet-insecure-tls`
+* `--kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname`
+
+Verificación:
+
+* `kubectl top nodes`
+* `kubectl top pods -n web`
+
+> Metrics-server y `kubectl top` aparecen como parte habitual de observabilidad y troubleshooting. 
+
+---
+
+## 5) HPA (Horizontal Pod Autoscaler)
+
+### 5.1 Creación del HPA
+
+`manifests/web/06-hpa.yaml`
 
 ```yaml
 apiVersion: autoscaling/v2
@@ -413,63 +266,32 @@ spec:
         averageUtilization: 50
 ```
 
-Aplicar/validar:
+### 5.2 Problema encontrado
 
-```bash
-kubectl apply -f hpa-web.yaml
-kubectl -n web get hpa
-kubectl top pods -n web
-```
+El HPA marcaba “invalid metrics / missing request for cpu”:
 
----
+* **Causa**: faltaban `resources.requests.cpu` (y/o memory) en el container del deployment.
+* **Solución**: añadir `requests/limits` al Deployment (ver sección 3.5) y esperar rollout.
 
-## 7) Metrics Server
+Verificación:
 
-### Instalación (upstream)
+* `kubectl -n web get hpa`
+* `kubectl -n web describe hpa web-php-hpa`
 
-```bash
-kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
-kubectl -n kube-system get pods -l k8s-app=metrics-server -o wide
-kubectl get apiservice v1beta1.metrics.k8s.io -o wide
-```
-
-### Error encontrado (típico lab) y solución
-
-**Error (logs):**
-
-* `x509: cannot validate certificate ... doesn't contain any IP SANs`
-* `no metrics to serve`, readiness probe falla
-
-**Solución aplicada (patch):**
-
-```bash
-kubectl -n kube-system patch deployment metrics-server \
-  --type='json' \
-  -p='[
-    {"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"},
-    {"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-preferred-address-types=InternalIP,Hostname,ExternalIP"}
-  ]'
-
-kubectl -n kube-system rollout status deployment/metrics-server
-kubectl get apiservice v1beta1.metrics.k8s.io -o wide
-kubectl top nodes
-kubectl top pods -n web
-```
+> El autoscaling depende de métricas (vía metrics-server) y los “resource requests” son fundamentales para decisiones del scheduler/autoscaling.
 
 ---
 
-## 8) MetalLB
+## 6) MetalLB para `LoadBalancer` (requisito actividad_3)
 
-### Instalación (upstream)
+### 6.1 Instalación
 
-```bash
-kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.8/config/manifests/metallb-native.yaml
-kubectl get pods -n metallb-system -o wide
-```
+* Namespace `metallb-system`
+* Pods controller/speaker en Running
 
-### Configuración pool + L2Advertisement
+### 6.2 Pool y L2Advertisement
 
-**metallb-pool.yaml**
+`manifests/metallb/metallb-pool.yaml`
 
 ```yaml
 apiVersion: metallb.io/v1beta1
@@ -491,81 +313,463 @@ spec:
   - pool-k8s
 ```
 
-Aplicar/validar:
+### 6.3 Web service como LoadBalancer
+
+* `kubectl -n web patch svc web-php-svc -p '{"spec":{"type":"LoadBalancer"}}'`
+* Obtuvo `EXTERNAL-IP` (ej. `192.168.1.20`)
+* Prueba: `curl http://192.168.1.20`
+
+> MetalLB es requisito para poder usar `Service type LoadBalancer` en entornos on-prem/lab. 
+
+---
+
+## 7) Etiquetas y nodeSelector (base para “monitor node”)
+
+Se utilizó el mecanismo de **labels** + **nodeSelector** para forzar pods a nodos concretos (luego usado para Prometheus/Grafana). La idea:
+
+1. Etiquetar nodo:
+
+   * `kubectl label node monitor monitor=true`
+2. En el Pod/Deployment:
+
+   * `nodeSelector: { monitor: "true" }`
+
+> `nodeSelector` restringe el scheduling a nodos que tengan esas labels (hard requirement).
+
+---
+
+# 8) Automatización con Ansible (sobre el clúster ya creado)
+
+> La actividad también pide una parte con Ansible (sin Kubespray) y define VM “ansible” separada. 
+
+## 8.1 Estructura de proyecto (en nodo ansible)
+
+Ruta base: `~/k8s-ops/`
+
+Ejemplo de estructura:
+
+```
+k8s-ops/
+├─ ansible.cfg
+├─ inventories/
+│  └─ hosts.ini
+├─ playbooks/
+│  ├─ 01-cluster-check.yml
+│  ├─ 02-ensure-web.yml
+│  ├─ 03-rolling-restart-web.yml
+│  ├─ 04-ensure-metallb-pool.yml
+│  └─ 05-export-manifests.yml
+├─ manifests/
+│  ├─ web/               # namespace/pv/pvc/deploy/svc/hpa
+│  └─ metallb/           # pool + L2
+└─ exports/              # recursos exportados desde el cluster
+```
+
+## 8.2 Inventario
+
+`inventories/hosts.ini` (ejemplo)
+
+```ini
+[masters]
+master ansible_host=192.168.1.6
+
+[workers]
+worker1 ansible_host=192.168.1.7
+worker2 ansible_host=192.168.1.8
+monitor ansible_host=192.168.1.4
+
+[nfs]
+nfs ansible_host=192.168.1.9
+
+[all:vars]
+ansible_user=root
+ansible_python_interpreter=/usr/bin/python3
+```
+
+> Nota: se corrigieron warnings iniciales por “group y host con el mismo nombre” cambiando a grupos en plural.
+
+## 8.3 ansible.cfg (stdout_callback)
+
+Se detectó error: `Invalid callback for stdout specified: yaml`
+Se arregló cambiando el callback a `default`.
+
+Comando usado (edición “in-place”):
 
 ```bash
-kubectl apply -f metallb-pool.yaml
-kubectl get pods -n metallb-system
-kubectl -n web get svc web-php-svc -o wide
-curl -s http://192.168.1.20 | head
+sed -i 's/^stdout_callback *=.*/stdout_callback = default/' ansible.cfg
 ```
 
 ---
 
-## 9) “Limpieza” del Service (quitar NodePort si venía de NodePort)
+## 8.4 Playbook 01 — Check básico del cluster
 
-Si el Service nació como NodePort y se cambió a LoadBalancer, puede conservar `nodePort`.
+`playbooks/01-cluster-check.yml` (ejemplo funcional)
 
-Comprobación:
+```yaml
+---
+- name: Check básico del cluster Kubernetes
+  hosts: localhost
+  gather_facts: false
 
-```bash
-kubectl -n web get svc web-php-svc -o wide
-kubectl -n web get svc web-php-svc -o jsonpath='{.spec.ports[0].nodePort}{"\n"}'
-```
+  tasks:
+    - name: Nodos
+      command: kubectl get nodes -o wide
+      register: nodes
 
-Solución (redefinir puertos sin nodePort):
+    - name: Mostrar nodos
+      debug:
+        var: nodes.stdout_lines
 
-```bash
-kubectl -n web patch svc web-php-svc --type='merge' -p '{
-  "spec":{
-    "ports":[
-      {"port":80,"protocol":"TCP","targetPort":80}
-    ]
-  }
-}'
+    - name: Estado app web
+      command: kubectl -n web get deploy,svc,hpa,pods -o wide
+      register: web
+
+    - name: Mostrar app web
+      debug:
+        var: web.stdout_lines
+
+    - name: Top nodes
+      command: kubectl top nodes
+      register: top_nodes
+      failed_when: false
+
+    - name: Mostrar top nodes
+      debug:
+        var: top_nodes.stdout_lines
 ```
 
 ---
 
-## 10) Verificaciones finales (estado esperado)
+## 8.5 Playbook 02 — Asegurar recursos de la app web (idempotente)
 
-### Cluster
+`playbooks/02-ensure-web.yml`
+
+```yaml
+---
+- name: Asegurar recursos de la app web (namespace, pv/pvc, deploy, svc, hpa)
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Aplicar manifests web (idempotente)
+      command: kubectl apply -f manifests/web/
+      args:
+        chdir: "{{ playbook_dir }}/.."
+      register: apply_web
+
+    - name: Mostrar salida apply
+      debug:
+        var: apply_web.stdout_lines
+
+    - name: Ver estado
+      command: kubectl -n web get deploy,svc,hpa,pods -o wide
+      register: state
+
+    - name: Mostrar estado
+      debug:
+        var: state.stdout_lines
+```
+
+> Concepto: aplicar manifests desde Ansible es un patrón común (vía `k8s` module o ejecutando `kubectl apply` desde el controlador).
+
+---
+
+## 8.6 Playbook 03 — Rolling restart del deployment
+
+`playbooks/03-rolling-restart-web.yml`
+
+```yaml
+---
+- name: Rolling restart del deployment web-php
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Reiniciar deployment (rolling restart)
+      command: kubectl -n web rollout restart deploy/web-php
+      register: restart_out
+
+    - name: Mostrar salida restart
+      debug:
+        var: restart_out.stdout_lines
+
+    - name: Esperar a que termine el rollout
+      command: kubectl -n web rollout status deploy/web-php
+      register: rollout
+
+    - name: Mostrar estado final
+      debug:
+        var: rollout.stdout_lines
+```
+
+---
+
+## 8.7 Playbook 04 — Asegurar MetalLB pool + L2
+
+`playbooks/04-ensure-metallb-pool.yml`
+
+```yaml
+---
+- name: Asegurar MetalLB pool + L2
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Aplicar MetalLB pool (idempotente)
+      command: kubectl apply -f manifests/metallb/metallb-pool.yaml
+      args:
+        chdir: "{{ playbook_dir }}/.."
+      register: out
+
+    - name: Mostrar apply
+      debug:
+        var: out.stdout_lines
+
+    - name: Ver pods metallb-system
+      command: kubectl -n metallb-system get pods -o wide
+      register: pods
+
+    - name: Mostrar pods
+      debug:
+        var: pods.stdout_lines
+```
+
+---
+
+## 8.8 Playbook 05 — Exportar manifests “reales” desde el cluster
+
+Objetivo: guardar recursos tal como están en el clúster (útil para auditoría/backup).
+
+Ejemplo:
+`playbooks/05-export-manifests.yml`
+
+```yaml
+---
+- name: Exportar recursos Kubernetes a YAML
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    outdir: "{{ playbook_dir }}/../exports"
+
+  tasks:
+    - name: Crear carpeta exports
+      file:
+        path: "{{ outdir }}"
+        state: directory
+
+    - name: Export ns web
+      command: kubectl get ns web -o yaml
+      register: ns_web
+    - copy:
+        dest: "{{ outdir }}/ns-web.yaml"
+        content: "{{ ns_web.stdout }}"
+
+    - name: Export PV/PVC web
+      command: kubectl get pv pv-nfs-web -o yaml
+      register: pv
+    - copy:
+        dest: "{{ outdir }}/pv-nfs-web.yaml"
+        content: "{{ pv.stdout }}"
+
+    - command: kubectl -n web get pvc pvc-nfs-web -o yaml
+      register: pvc
+    - copy:
+        dest: "{{ outdir }}/pvc-nfs-web.yaml"
+        content: "{{ pvc.stdout }}"
+
+    - name: Export deploy/svc/hpa web
+      command: kubectl -n web get deploy web-php -o yaml
+      register: dep
+    - copy:
+        dest: "{{ outdir }}/web-deployment.yaml"
+        content: "{{ dep.stdout }}"
+
+    - command: kubectl -n web get svc web-php-svc -o yaml
+      register: svc
+    - copy:
+        dest: "{{ outdir }}/web-service.yaml"
+        content: "{{ svc.stdout }}"
+
+    - command: kubectl -n web get hpa web-php-hpa -o yaml
+      register: hpa
+    - copy:
+        dest: "{{ outdir }}/web-hpa.yaml"
+        content: "{{ hpa.stdout }}"
+```
+
+En la práctica se generaron ficheros exportados, por ejemplo:
+
+* `metallb-pool-k8s.yaml`
+* `metallb-l2-k8s.yaml`
+* `ns-web.yaml`
+* `pv-nfs-web.yaml`
+* `pvc-nfs-web.yaml`
+* `web-deployment.yaml`
+* `web-service.yaml`
+* `web-hpa.yaml`
+
+---
+
+# 9) Prometheus + Grafana (kube-prometheus-stack) en nodo monitor
+
+## 9.1 Añadir nodo monitor como nuevo worker
+
+* Se creó VM `monitor` (IP `192.168.1.4`)
+* Se instaló `containerd`, `kubelet`, `kubeadm` y se ejecutó `kubeadm join ...`
+* Verificación:
+
+  * `kubectl get nodes -o wide` → `monitor Ready`
+
+## 9.2 Label y nodeSelector (monitor dedicado)
+
+Label:
+
+```bash
+kubectl label node monitor monitor=true
+kubectl get nodes -L monitor
+```
+
+> Los pods con `nodeSelector` solo se programan en nodos que cumplan esa label.
+
+## 9.3 Instalación de Helm (en master)
+
+Dependencias necesarias:
+
+* `git`, `tar` (para que el script pueda descargar y extraer el binario)
+
+Instalación:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+helm version
+```
+
+## 9.4 Despliegue kube-prometheus-stack forzando Prometheus/Grafana a `monitor`
+
+Namespace:
+
+```bash
+kubectl create ns monitoring
+```
+
+Values:
+`k8s-manifests/monitoring-values.yaml`
+
+```yaml
+prometheus:
+  prometheusSpec:
+    nodeSelector:
+      monitor: "true"
+
+grafana:
+  nodeSelector:
+    monitor: "true"
+```
+
+Instalación:
+
+```bash
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+
+helm install monitoring prometheus-community/kube-prometheus-stack \
+  -n monitoring \
+  -f k8s-manifests/monitoring-values.yaml
+```
+
+Verificación:
+
+```bash
+kubectl -n monitoring get pods -o wide | egrep -i "prometheus|grafana|alertmanager"
+```
+
+Resultado esperado:
+
+* **prometheus** y **grafana** en `NODE=monitor`
+* `node-exporter` (DaemonSet) en todos los nodos (master/workers/monitor), comportamiento típico de DaemonSet. 
+
+## 9.5 Exponer Grafana y acceso
+
+Se expuso Grafana (ej. mediante `Service type LoadBalancer` con MetalLB) y se validó acceso vía navegador (pantalla “Welcome to Grafana”).
+
+Password admin (ejemplo típico):
+
+```bash
+kubectl get secret -n monitoring -l app.kubernetes.io/name=grafana \
+  -o jsonpath="{.items[0].data.admin-password}" | base64 -d; echo
+```
+
+## 9.6 Dashboards importados (ejemplos)
+
+* “Kubernetes Views Global” (ejemplo: ID 15757)
+* “Node Exporter Full” (ejemplo: ID 1860)
+
+---
+
+# 10) Comandos de verificación (resumen)
+
+## Estado cluster
 
 ```bash
 kubectl get nodes -o wide
 kubectl get pods -A
 ```
 
-### Componentes clave
-
-* `kube-flannel` (CNI) con DaemonSet en todos los nodos
-* `metrics-server` `READY 1/1` y APIService `AVAILABLE True`
-* `metallb-system` controller + speaker `1/1 Running`
-* Web app en namespace `web` con:
-
-  * Deployment `2/2 Ready`
-  * PVC `Bound`
-  * HPA con `TARGETS` numéricos (no `<unknown>`)
-  * Service LoadBalancer con EXTERNAL-IP `192.168.1.20`
-
-### App
+## App web
 
 ```bash
-kubectl -n web get deploy,pods,svc,hpa -o wide
-curl -s http://192.168.1.20 | head
+kubectl -n web get deploy,svc,hpa,pods -o wide
+kubectl -n web describe hpa web-php-hpa
+```
+
+## Storage
+
+```bash
+kubectl get pv
+kubectl -n web get pvc
+```
+
+## Métricas
+
+```bash
+kubectl top nodes
+kubectl top pods -n web
+```
+
+## MetalLB
+
+```bash
+kubectl -n metallb-system get pods -o wide
+kubectl -n web get svc web-php-svc -o wide
+```
+
+## Monitoring (Prom/Grafana)
+
+```bash
+kubectl -n monitoring get pods -o wide | egrep -i "prometheus|grafana|alertmanager"
+kubectl -n monitoring get svc | egrep -i "grafana|prometheus"
 ```
 
 ---
 
-## 11) Puntos clave aprendidos (resumen)
+# 11) Notas técnicas (lo más importante aprendido)
 
-* `swapoff` es requisito práctico para kubelet/kubeadm.
-* `ip_forward` + `br_netfilter` son críticos para red de pods y Services.
-* Tras `kubeadm init`, CoreDNS puede estar Pending hasta instalar CNI.
-* NFS: si `showmount` falla con RPC, revisar `rpcbind`, `nfs-server`, firewall.
-* HPA por CPU requiere `resources.requests.cpu`.
-* Metrics Server en labs kubeadm suele fallar por `x509` y se corrige con flags (`--kubelet-insecure-tls`).
-* MetalLB permite `Service: LoadBalancer` en bare-metal/VirtualBox, asignando IPs de un pool.
+* **Manifests YAML**: Kubernetes trabaja de forma declarativa: defines el estado deseado en `spec`, y los controladores llevan el clúster hacia ese estado; `status` refleja el estado real observado. 
+* **Labels/Selectors**: son clave para:
+
+  * Services (seleccionan pods)
+  * Deployments (encuentran sus pods)
+  * Scheduling por nodo (nodeSelector)
+* **HPA**: para CPU (%) necesitas:
+
+  * metrics-server funcionando
+  * `resources.requests.cpu` en el contenedor (si no, “missing request for cpu”).
+* **DaemonSet**: recursos como `node-exporter` se despliegan automáticamente en todos (o un subconjunto) de nodos. 
+* **Ansible + Kubernetes**: patrón común es “aplicar manifests” desde playbooks (módulo `k8s` o `kubectl apply`), manteniendo idempotencia y comprobaciones de estado.
 
 ```
+
+Si quieres, también puedo **adaptar este README a tu estructura exacta** (nombres reales de carpetas/archivos) si me pegas un `tree -L 3` del repo `k8s-ops/` y de tu carpeta `k8s-manifests/` en el master.
+::contentReference[oaicite:19]{index=19}
 ```
