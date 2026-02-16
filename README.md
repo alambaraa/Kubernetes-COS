@@ -769,7 +769,3 @@ kubectl -n monitoring get svc | egrep -i "grafana|prometheus"
 * **Ansible + Kubernetes**: patrón común es “aplicar manifests” desde playbooks (módulo `k8s` o `kubectl apply`), manteniendo idempotencia y comprobaciones de estado.
 
 ```
-
-Si quieres, también puedo **adaptar este README a tu estructura exacta** (nombres reales de carpetas/archivos) si me pegas un `tree -L 3` del repo `k8s-ops/` y de tu carpeta `k8s-manifests/` en el master.
-::contentReference[oaicite:19]{index=19}
-```
