@@ -1,6 +1,6 @@
 # Actividad 3 — Kubernetes (kubeadm) + Web + NFS + HPA + MetalLB + Ansible + Prometheus/Grafana
 
-> Proyecto realizado siguiendo los requisitos de **actividad_3**: clúster con **kubeadm (1 master + 2 workers)**, despliegue de **servidor web (Apache/PHP)** con **YAML**, **HPA** (requiere **metrics-server**), **MetalLB** para `LoadBalancer`, y **NFS** para persistencia compartida por todos los pods web. :contentReference[oaicite:0]{index=0}
+> Proyecto realizado siguiendo los requisitos de **actividad_3**: clúster con **kubeadm (1 master + 2 workers)**, despliegue de **servidor web (Apache/PHP)** con **YAML**, **HPA** (requiere **metrics-server**), **MetalLB** para `LoadBalancer`, y **NFS** para persistencia compartida por todos los pods web.
 
 ---
 
@@ -14,7 +14,7 @@
 - **ansible**: `192.168.1.5` (nodo de automatización)
 - **monitor**: `192.168.1.4` (nuevo worker para Prometheus/Grafana)
 
-> Nota: La actividad define explícitamente el uso de red NAT y las IPs/recursos orientativos para las VMs. :contentReference[oaicite:1]{index=1}
+> Nota: La actividad define explícitamente el uso de red NAT y las IPs/recursos orientativos para las VMs. 
 
 ---
 
@@ -41,7 +41,7 @@ En **master**:
 - `kubeadm init ...` (con CIDR compatible con Flannel)
 - Configurar kubeconfig para kubectl (usuario administrador)
 
-> En kubeadm, el init genera también el comando `kubeadm join` para los workers. :contentReference[oaicite:2]{index=2}
+> En kubeadm, el init genera también el comando `kubeadm join` para los workers. 
 
 ---
 
@@ -73,7 +73,7 @@ Comandos típicos:
 - `showmount -e 192.168.1.9`
 - Servicios: `rpcbind`, `nfs-server`
 
-> Requisito: “Añadir nodo NFS… y todos los pods deben servir la misma página almacenada en NFS”. :contentReference[oaicite:3]{index=3}
+> Requisito: “Añadir nodo NFS… y todos los pods deben servir la misma página almacenada en NFS”. 
 
 ---
 
