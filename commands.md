@@ -1,4 +1,3 @@
-````md
 # Kubernetes — Comandos de verificación, salud del clúster y pruebas (HA, reparto de carga, resiliencia)
 
 Este documento recopila **comandos prácticos** para:
